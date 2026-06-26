@@ -50,7 +50,9 @@
 
 ## 4. 侦测逻辑
 
-- 模型：Espressif **esp-dl 的 `human_face_detect`** 组件（经 IDF component manager 引入）。用法约为 `HumanFaceDetect detect; auto& results = detect.run(img);`，`img` 由相机帧（RGB565）构造。
+- 模型：**`espressif/human_face_detect` v0.5.0**（自动带入 `esp-dl ~3.3.x`；要求 IDF ≥5.3，我们 5.5.4 满足）。默认模型 **MSRMNP_S8_V1 ≈ 187KB**，以 RODATA 嵌入 app 二进制，**无需新增分区**（OTA 槽各 ~5MB 够用）。
+- 用法（已对照 esp-dl 当前 master 核实）：构造 `dl::image::img_t`（指向相机帧 + 宽高 + `pix_type`）→ **只构造一次** `HumanFaceDetect`（含模型权重，很重）→ `auto& results = detect.run(img);` 返回 `std::list<dl::detect::result_t>&`，每个 `result_t` 有 `box`[x1,y1,x2,y2]、`score`、`box_area()`。在 **≥8KB 栈**的独立任务里跑；默认模型单帧 ~44ms（>20FPS）。resize 由 run() 自动完成，返回的 box 已映射回输入帧尺寸。
+- ⚠️ **相机像素格式**：sdkconfig 当前为 `CAMERA_GC0308_DVP_YUV422`（YUYV），非 RGB565。esp-dl 直接支持 `DL_IMAGE_PIX_TYPE_YUYV`。Phase 1 需确认 `Capture()/GetFrameData()` 给出的是原始 YUYV 还是已转 RGB565 的显示缓冲，据此设 `pix_type`（RGB565 用 `DL_IMAGE_PIX_TYPE_RGB565LE`）。
 - 取帧：`auto* cam = hal_bridge::board_get_camera(); cam->Capture();` 然后 `cam->GetFrameData()/GetFrameWidth()/GetFrameHeight()/GetFrameFormat()`。
 - 命中判据：
   - 存在人脸且 `score ≥ MIN_FACE_SCORE`（默认 0.50）；
@@ -105,7 +107,13 @@
 - `firmware/main/apps/apps.h` —— `#include "app_sentry/app_sentry.h"`。
 - `firmware/main/main.cpp` —— `GetMooncake().installApp(std::make_unique<AppSentry>())`。
 - `firmware/main/Kconfig.projbuild` —— 新增 §7 配置项。
-- `firmware/main/idf_component.yml` —— 增加 `espressif/human_face_detect` 依赖。
+- `firmware/main/idf_component.yml` —— 增加依赖：
+  ```yaml
+  espressif/human_face_detect:
+    version: "^0.5.0"
+    rules:
+    - if: target in [esp32s3]
+  ```
 - `firmware/main/CMakeLists.txt` —— 注册新源文件 + 图标资源（如需要）。
 
 ## 9. 构建与烧录工作流
@@ -120,7 +128,7 @@
 
 ## 10. 风险与先验证（de-risk）
 
-1. **esp-dl 集成与分区容量（最高风险）**：Phase 1 先单独跑通 `human_face_detect` 并串口打印框/score/面积占比，确认模型能装进 5MB app 分区且帧率可接受，再继续。
+1. **esp-dl 集成（风险已大幅降低）**：研究已确认默认模型仅 ~187KB(RODATA)、**无需改分区**、单帧 ~44ms。Phase 1 仍先单独跑通 `human_face_detect`：串口打印 box/score/面积占比，并确认相机像素格式(YUYV vs RGB565)，再接报警逻辑。
 2. **相机独占**：avatar/视频也用相机；哨兵运行时独占，同一帧内完成检测+编码。
 3. **帧格式**：`Capture()` 输出 RGB565（可能因旋转交换宽高）；需按实际 `GetFrameFormat()`/宽高构造 esp-dl 输入。
 4. **Telegram 可达性**：设备所在网络需能访问 `api.telegram.org`；失败有重试+提示。
