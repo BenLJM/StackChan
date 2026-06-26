@@ -9,6 +9,7 @@
 #include <mooncake.h>
 #include <apps/apps.h>
 #include <hal/hal.h>
+#include "apps/app_sentry/sentry_selftest.h"
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -26,6 +27,11 @@ extern "C" void app_main(void)
     ui_hal::on_delay([](uint32_t ms) { GetHAL().delay(ms); });
     ui_hal::on_get_tick([]() { return GetHAL().millis(); });
 
+#ifdef SENTRY_SELFTEST
+    // Remote auto-test: run the face-detection pipeline on live camera at boot.
+    sentry_selftest_run();
+#endif
+
     const bool skip_mooncake =
         GetHAL().getXiaozhiConfig().startAiAgentOnBoot && GetHAL().getWarmRebootTarget() < 0;
 
@@ -38,6 +44,7 @@ extern "C" void app_main(void)
         GetMooncake().installApp(std::make_unique<AppAppCenter>());
         GetMooncake().installApp(std::make_unique<AppEzdata>());
         GetMooncake().installApp(std::make_unique<AppDance>());
+        GetMooncake().installApp(std::make_unique<AppSentry>());
         GetMooncake().installApp(std::make_unique<AppSetup>());
 
         // Main loop
