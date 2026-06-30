@@ -66,11 +66,8 @@ dependencies:
   espressif/adc_battery_estimation: ^0.2.0
   espressif/esp_new_jpeg: ^0.6.1
 
-  # On-device face detection for the Sentry app (pulls in espressif/esp-dl)
-  espressif/human_face_detect:
-    version: "^0.5.0"
-    rules:
-    - if: target in [esp32s3]
+  # (Sentry uses camera motion detection; esp-dl face detection removed — its
+  #  detection box-decode is broken on this build, see git history.)
 
   # SenseCAP Watcher Board
   wvirgil123/sscma_client:

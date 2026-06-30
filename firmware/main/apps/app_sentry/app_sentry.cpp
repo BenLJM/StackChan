@@ -4,87 +4,79 @@
  * SPDX-License-Identifier: MIT
  */
 #include "app_sentry.h"
+#include "motion_detect.h"
 #include <hal/hal.h>
 #include <hal/board/hal_bridge.h>
 #include <mooncake.h>
 #include <mooncake_log.h>
 #include <smooth_lvgl.hpp>
-
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <atomic>
+#include "jpg/image_to_jpeg.h"
+#include <lvgl.h>
+#include <cstdio>
 #include <memory>
-
-// esp-dl on-device face detection (component: espressif/human_face_detect)
-#include "human_face_detect.hpp"
-#include "dl_image_define.hpp"
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
 
 static const char* TAG = "Sentry";
 
+// Tunables
+static const int MOTION_TRIG_PERMILLE = 60;     // 6% of frame changed = motion
+static const int CONSECUTIVE_HITS     = 2;      // require N consecutive motion samples
+static const uint32_t GRACE_MS        = 8000;   // arming countdown (leave the frame)
+static const uint32_t ALERT_MS        = 4000;   // how long the warning stays up
+static const uint32_t COOLDOWN_MS     = 30000;  // min gap between alerts
+static const uint32_t CHECK_MS        = 150;    // motion sampling period
+static const char* WARN_TEXT          = "\xE9\x9D\x9E\xE8\xAF\xB7\xE5\x8B\xBF\xE5\x8A\xA8";  // 非请勿动 (UTF-8)
+
+enum SentryState { ST_ARMING, ST_ARMED, ST_ALERTING, ST_COOLDOWN };
+
 static std::unique_ptr<Button> _btn_quit;
-static TaskHandle_t _detect_task = nullptr;
-static std::atomic<bool> _running{false};
-static std::atomic<bool> _task_done{false};
+static lv_obj_t* _label_status = nullptr;
+static lv_obj_t* _label_warn   = nullptr;
+static MotionDetector _md;
+static SentryState _state;
+static uint32_t _state_ms;
+static uint32_t _last_check_ms;
+static int _hits;
 
-// Background detection loop. esp-dl needs a generous stack, so this runs on its
-// own task (not the UI/main loop). It only logs for now (Phase 1).
-static void detect_task(void* /*arg*/)
+// --- helpers (LVGL helpers must be called under LvglLockGuard) ---
+static void set_status(const char* txt)
 {
-    mclog::tagInfo(TAG, "detect task start");
+    if (_label_status) lv_label_set_text(_label_status, txt);
+}
 
-    // The detector loads model weights + allocates an arena; build it ONCE.
-    HumanFaceDetect* detector = new HumanFaceDetect();
-
-    while (_running.load()) {
-        auto* camera = hal_bridge::board_get_camera();
-        if (camera && camera->StreamCaptures()) {
-            const uint8_t* data = camera->GetFrameData();
-            int w   = camera->GetFrameWidth();
-            int h   = camera->GetFrameHeight();
-            int fmt = camera->GetFrameFormat();
-
-            if (data && w > 0 && h > 0) {
-                dl::image::img_t img;
-                img.data   = (void*)data;
-                img.width  = (uint16_t)w;
-                img.height = (uint16_t)h;
-                // The camera HAL outputs either RGB565 (display path) or YUYV.
-                if (fmt == V4L2_PIX_FMT_YUYV) {
-                    img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_YUYV;
-                } else {
-                    img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
-                }
-
-                auto& results       = detector->run(img);
-                const int frame_area = w * h;
-                int idx              = 0;
-                for (auto& r : results) {
-                    int box_area     = (r.box.size() >= 4) ? r.box_area() : 0;
-                    int area_permille = (frame_area > 0) ? (int)((int64_t)box_area * 1000 / frame_area) : 0;
-                    int score_pct    = (int)(r.score * 100.0f);
-                    if (r.box.size() >= 4) {
-                        mclog::tagInfo(TAG, "face #{} score={}% box=[{},{},{},{}] area={}permille",
-                                       idx, score_pct, r.box[0], r.box[1], r.box[2], r.box[3], area_permille);
-                    }
-                    idx++;
-                }
-                if (idx == 0) {
-                    mclog::tagInfo(TAG, "frame {}x{} fmt={} no face", w, h, fmt);
-                }
-            }
+static void show_warning_ui(bool on)
+{
+    if (_label_warn) {
+        if (on) {
+            lv_obj_clear_flag(_label_warn, LV_OBJ_FLAG_HIDDEN);
         } else {
-            mclog::tagInfo(TAG, "camera capture failed");
+            lv_obj_add_flag(_label_warn, LV_OBJ_FLAG_HIDDEN);
         }
-        vTaskDelay(pdMS_TO_TICKS(300));
     }
+    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(on ? 0x500000 : 0x000000), 0);
+}
 
-    delete detector;
-    mclog::tagInfo(TAG, "detect task exit");
-    _task_done.store(true);
-    vTaskDelete(nullptr);
+// Capture the current camera frame as JPEG (the "intruder photo"). Phase B2 logs
+// it; Phase B3 will POST it to Telegram instead of freeing it.
+static void capture_intruder_photo()
+{
+    auto* cam = hal_bridge::board_get_camera();
+    if (!cam) return;
+    const uint8_t* data = cam->GetFrameData();
+    int w               = cam->GetFrameWidth();
+    int h               = cam->GetFrameHeight();
+    int fmt             = cam->GetFrameFormat();
+    size_t sz           = cam->GetFrameSize();
+    if (!data || w <= 0 || h <= 0) return;
+
+    uint8_t* jpg = nullptr;
+    size_t jlen  = 0;
+    if (image_to_jpeg((uint8_t*)data, sz, w, h, (v4l2_pix_fmt_t)fmt, 80, &jpg, &jlen) && jpg) {
+        mclog::tagInfo(TAG, "captured intruder photo: {} bytes (Telegram upload = Phase B3)", (int)jlen);
+        free(jpg);
+    }
 }
 
 AppSentry::AppSentry()
@@ -103,31 +95,127 @@ void AppSentry::onOpen()
 
     {
         LvglLockGuard lock;
+        lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x000000), 0);
+
+        _label_status = lv_label_create(lv_screen_active());
+        lv_obj_align(_label_status, LV_ALIGN_TOP_MID, 0, 8);
+        lv_obj_set_style_text_color(_label_status, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(_label_status, "SENTRY");
+
+        _label_warn = lv_label_create(lv_screen_active());
+        lv_obj_align(_label_warn, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_color(_label_warn, lv_color_hex(0xFF3030), 0);
+        // Use the theme default font (font_puhui) which has Chinese glyphs.
+        lv_label_set_text(_label_warn, WARN_TEXT);
+        lv_obj_add_flag(_label_warn, LV_OBJ_FLAG_HIDDEN);
+
         _btn_quit = std::make_unique<Button>(lv_screen_active());
-        _btn_quit->setAlign(LV_ALIGN_CENTER);
+        _btn_quit->setAlign(LV_ALIGN_BOTTOM_MID);
         _btn_quit->label().setText(LV_SYMBOL_CLOSE " EXIT");
         _btn_quit->onClick().connect([this]() { close(); });
     }
 
-    // Start the detection task (16 KB stack, pinned to the app core).
-    _running.store(true);
-    _task_done.store(false);
-    xTaskCreatePinnedToCore(detect_task, "sentry_detect", 16384, nullptr, 4, &_detect_task, 1);
+    GetHAL().showRgbColor(0, 0, 0);
+    _md.reset();
+    _hits          = 0;
+    _last_check_ms = 0;
+    _state         = ST_ARMING;
+    _state_ms      = GetHAL().millis();
 }
 
-void AppSentry::onRunning() {}
+void AppSentry::onRunning()
+{
+    uint32_t now = GetHAL().millis();
+    if (now - _last_check_ms < CHECK_MS) {
+        return;
+    }
+    _last_check_ms = now;
+
+    // Sample motion (camera/JPEG are NOT LVGL — do them without the LVGL lock).
+    int mp    = 0;
+    bool have = false;
+    auto* cam = hal_bridge::board_get_camera();
+    if (cam && cam->StreamCaptures()) {
+        const uint8_t* data = cam->GetFrameData();
+        int w               = cam->GetFrameWidth();
+        int h               = cam->GetFrameHeight();
+        if (data && w > 0 && h > 0 && _md.update(data, w, h)) {
+            mp   = _md.motionPermille();
+            have = _md.hasPrev();
+        }
+    }
+
+    bool do_capture = false;
+
+    {
+        LvglLockGuard lock;
+        switch (_state) {
+        case ST_ARMING: {
+            if (now - _state_ms > GRACE_MS) {
+                _state = ST_ARMED;
+                _hits  = 0;
+                set_status("ARMED");
+            } else {
+                char buf[24];
+                snprintf(buf, sizeof(buf), "ARMING %lus", (unsigned long)((GRACE_MS - (now - _state_ms)) / 1000 + 1));
+                set_status(buf);
+            }
+            break;
+        }
+        case ST_ARMED: {
+            if (have && mp >= MOTION_TRIG_PERMILLE) {
+                _hits++;
+            } else {
+                _hits = 0;
+            }
+            if (_hits >= CONSECUTIVE_HITS) {
+                _hits     = 0;
+                _state    = ST_ALERTING;
+                _state_ms = now;
+                set_status("ALERT");
+                show_warning_ui(true);
+                do_capture = true;
+                mclog::tagInfo(TAG, "ALERT: motion={}permille", mp);
+            }
+            break;
+        }
+        case ST_ALERTING: {
+            if (now - _state_ms > ALERT_MS) {
+                _state    = ST_COOLDOWN;
+                _state_ms = now;
+                show_warning_ui(false);
+                set_status("COOLDOWN");
+            }
+            break;
+        }
+        case ST_COOLDOWN: {
+            if (now - _state_ms > COOLDOWN_MS) {
+                _state = ST_ARMED;
+                _md.reset();
+                set_status("ARMED");
+            }
+            break;
+        }
+        }
+    }
+
+    // LED + photo outside the LVGL lock.
+    if (_state == ST_ALERTING && do_capture) {
+        GetHAL().showRgbColor(255, 0, 0);
+        capture_intruder_photo();
+    } else if (_state == ST_COOLDOWN && now - _state_ms < CHECK_MS * 2) {
+        GetHAL().showRgbColor(0, 0, 0);  // turn LEDs off as we enter cooldown
+    }
+}
 
 void AppSentry::onClose()
 {
     mclog::tagInfo(TAG, "on close");
-
-    // Ask the detection task to stop and wait (up to ~2s) for it to finish.
-    _running.store(false);
-    for (int i = 0; i < 200 && !_task_done.load(); i++) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    _detect_task = nullptr;
+    GetHAL().showRgbColor(0, 0, 0);
 
     LvglLockGuard lock;
+    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x000000), 0);
+    if (_label_status) { lv_obj_del(_label_status); _label_status = nullptr; }
+    if (_label_warn) { lv_obj_del(_label_warn); _label_warn = nullptr; }
     _btn_quit.reset();
 }
