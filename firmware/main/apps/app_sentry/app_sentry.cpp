@@ -19,11 +19,9 @@
 #include <string>
 
 #include <board.h>
-#include "esp_netif.h"
+#include "ping/ping_sock.h"
 extern "C" {
-#include "lwip/netif.h"
-#include "lwip/etharp.h"
-#include "lwip/ip4_addr.h"
+#include "lwip/ip_addr.h"
 }
 
 using namespace mooncake;
@@ -59,10 +57,13 @@ static const uint32_t COOLDOWN_MS       = 15000;
 static const uint32_t CHECK_MS          = 100;
 
 // ---- Presence tunables ----
-static const uint32_t PROBE_MS        = 8000;   // how often we ARP-probe the phone
-static const uint32_t AWAY_CONFIRM_MS = 60000;  // phone unseen this long -> "away" -> arm
-                                                // (ARP cache lingers a few min, so real
-                                                //  away-lag is a couple minutes; that's fine)
+// We ping the phone in the background (esp_ping). A reply refreshes "last seen"; no reply
+// for AWAY_CONFIRM_MS -> owner is away -> arm. ICMP gives fresh liveness (unlike ARP whose
+// cache lingers ~4 min), so away is detected quickly.
+static const uint32_t PING_INTERVAL_MS = 4000;   // background ping cadence
+static const uint32_t PING_TIMEOUT_MS  = 1500;
+static const uint32_t AWAY_CONFIRM_MS  = 90000;  // phone unseen this long -> "away" (~1.5 min)
+static const uint32_t LOG_MS           = 5000;   // presence debug log throttle
 
 // ---- Head-shake tunables ----
 static const int SHAKE_AMP          = 300;
@@ -72,7 +73,6 @@ static const uint32_t LED_FLASH_MS  = 250;
 
 enum SentryState { ST_NOWIFI, ST_DISARMED, ST_ARMING, ST_ARMED, ST_ALERTING, ST_COOLDOWN };
 enum PresenceCond { C_NOWIFI, C_PRESENT, C_AWAY };
-enum Presence { PR_NOWIFI, PR_SEEN, PR_UNSEEN };
 
 static std::unique_ptr<Button> _btn_quit;
 static lv_obj_t* _scr        = nullptr;
@@ -84,83 +84,48 @@ static PresenceCond _cond;
 static uint32_t _state_ms;
 static uint32_t _last_check_ms;
 static uint32_t _last_probe_ms;
-static uint32_t _present_seen_ms;
+static volatile uint32_t _present_seen_ms;  // stamped by the ping-reply callback (other task)
 static bool _wifi_ok;
 static int _hits;
 static int _shake_dir;
 static uint32_t _shake_ms;
 
-// --- ARP presence probe ---
-struct ArpProbe {
-    ip4_addr_t ip;
-    bool wifi;
-    bool found;
-    bool gw_found;   // diagnostic: can we ARP our own gateway?
-    uint32_t netif_ip;
-};
+// --- Owner presence via a background ICMP ping session ---
+// esp_ping runs in its own task; each reply stamps _present_seen_ms. The main loop reads
+// _wifi_ok (from the HAL) + _present_seen_ms to decide present / away.
+static esp_ping_handle_t _ping_handle = nullptr;
+static bool _ping_started             = false;
 
-// An ARP-capable, up netif with a real IP (the WiFi STA). MUST have NETIF_FLAG_ETHARP:
-// calling etharp_* on the loopback netif (which is "up" with 127.0.0.1) asserts.
-static bool netif_usable(struct netif* n)
+// Runs in the esp_ping task context on each successful echo reply.
+static void on_ping_success(esp_ping_handle_t hdl, void* args)
 {
-    return n && netif_is_up(n) && (n->flags & NETIF_FLAG_ETHARP) &&
-           !ip4_addr_isany_val(*netif_ip4_addr(n));
+    _present_seen_ms = GetHAL().millis();
 }
 
-// Runs in the lwIP TCP/IP thread (via esp_netif_tcpip_exec) so etharp_* is safe.
-static esp_err_t arp_probe_cb(void* ctx)
+static void start_ping_session()
 {
-    ArpProbe* p       = static_cast<ArpProbe*>(ctx);
-    struct netif* nif = netif_default;
-    if (!netif_usable(nif)) {
-        nif = nullptr;
-        for (struct netif* n = netif_list; n != nullptr; n = n->next) {
-            if (netif_usable(n)) {
-                nif = n;
-                break;
-            }
-        }
+    ip_addr_t target = {};
+    if (!ipaddr_aton(OWNER_IP, &target)) {
+        return;
     }
-    if (!nif) {
-        p->wifi = false;
-        return ESP_OK;
+    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+    cfg.target_addr       = target;
+    cfg.count             = 0;  // 0 = infinite
+    cfg.interval_ms       = PING_INTERVAL_MS;
+    cfg.timeout_ms        = PING_TIMEOUT_MS;
+
+    esp_ping_callbacks_t cbs = {};
+    cbs.on_ping_success      = on_ping_success;
+
+    if (esp_ping_new_session(&cfg, &cbs, &_ping_handle) == ESP_OK && _ping_handle) {
+        esp_ping_start(_ping_handle);
+        mclog::tagInfo(TAG, "ping session started -> {}", OWNER_IP);
     }
-
-    p->wifi     = true;
-    p->netif_ip = netif_ip4_addr(nif)->addr;
-
-    struct eth_addr* eth_ret = nullptr;
-    const ip4_addr_t* ip_ret = nullptr;
-    p->found                 = (etharp_find_addr(nif, &p->ip, &eth_ret, &ip_ret) >= 0);
-    etharp_request(nif, &p->ip);  // refresh/renew for next probe
-
-    // Diagnostic: is the gateway ARP-reachable? (proves our ARP path works at all)
-    const ip4_addr_t* gw = netif_ip4_gw(nif);
-    p->gw_found          = (etharp_find_addr(nif, gw, &eth_ret, &ip_ret) >= 0);
-    etharp_request(nif, gw);
-    return ESP_OK;
 }
 
-// WiFi is started once (async). WifiBoard::StartNetwork() is non-blocking — it kicks off
-// the connect and returns; the ARP probe detects when the link is actually up. (The HAL's
-// startNetwork() wrapper busy-waits until connected, which would freeze the mooncake loop.)
+// WiFi is started once (async). WifiBoard::StartNetwork() is non-blocking — it kicks off the
+// connect and returns; getWifiStatus() tells us when the link is actually up.
 static bool _wifi_started = false;
-
-static Presence probe_phone()
-{
-    static ArpProbe p;
-    ip4addr_aton(OWNER_IP, &p.ip);
-    p.wifi     = false;
-    p.found    = false;
-    p.gw_found = false;
-    p.netif_ip = 0;
-    esp_netif_tcpip_exec(arp_probe_cb, &p);
-    uint32_t a = p.netif_ip;
-    mclog::tagInfo(TAG, "probe: wifi={} phone={} gw={} netif={}.{}.{}.{}", p.wifi, p.found, p.gw_found,
-                   (int)(a & 0xff), (int)((a >> 8) & 0xff), (int)((a >> 16) & 0xff), (int)((a >> 24) & 0xff));
-    if (!p.wifi) return PR_NOWIFI;
-    return p.found ? PR_SEEN : PR_UNSEEN;
-}
 
 // --- LVGL helpers (call under LvglLockGuard) ---
 static void set_main(const char* txt, uint32_t color)
@@ -302,16 +267,16 @@ void AppSentry::onRunning()
         }
     }
 
-    // (4) Presence probe (throttled).
-    if (now - _last_probe_ms >= PROBE_MS) {
+    // (4) Presence: WiFi status + background-ping freshness.
+    _wifi_ok = (GetHAL().getWifiStatus() != WifiStatus::None);
+    if (_wifi_ok && !_ping_started) {
+        _ping_started = true;
+        start_ping_session();
+    }
+    if (now - _last_probe_ms >= LOG_MS) {
         _last_probe_ms = now;
-        Presence pr    = probe_phone();
-        if (pr == PR_NOWIFI) {
-            _wifi_ok = false;
-        } else {
-            _wifi_ok = true;
-            if (pr == PR_SEEN) _present_seen_ms = now;
-        }
+        mclog::tagInfo(TAG, "presence: wifi={} last_reply={}s_ago", _wifi_ok,
+                       (int)((now - _present_seen_ms) / 1000));
     }
 
     // (5) Outer presence gate: NOWIFI / PRESENT(disarmed) / AWAY(run detection).

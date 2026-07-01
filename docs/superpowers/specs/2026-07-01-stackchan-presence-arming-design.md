@@ -11,16 +11,16 @@ The sentry triggers even when the owner is right next to it. The owner wants it 
 
 ## Decision
 
-Detect owner presence by whether their **phone is on the office WiFi**, using an
-**ARP probe** from the ESP32-S3 (no extra hardware; the device is already on WiFi).
+Detect owner presence by whether their **phone is on the office WiFi**, using a
+**background ICMP ping** from the ESP32-S3 (no extra hardware; the device is already on WiFi).
 
 - Chosen over BLE "phone as beacon": Android background-advertising is unreliable and
   China-market ROMs kill background apps → false "away" → false alarms. WiFi presence is
   maintained by the OS and is immune to app-killing.
-- Chosen over ICMP ping: a present phone's ARP entry *lingers*, so ARP **never**
-  false-reports "away" while the phone is on WiFi → no false alarms while present (the
-  exact complaint). Trade-off: "away" detection lags a few minutes (ARP cache expiry),
-  which is fine for "I left the office".
+- ARP was tried first but its cache entry *lingers* ~4 min after the phone leaves, so
+  "away" took ~5 min — too slow. ICMP gives *fresh* liveness: away is detected in
+  `AWAY_CONFIRM_MS` (~90 s). Requires the owner to disable per-network MAC randomization
+  (so the phone keeps a stable IP); verified this phone answers ping even when idle.
 
 ## Behavior
 
@@ -39,11 +39,14 @@ Outer presence gate wraps the existing sentry state machine:
 
 ## Implementation (firmware/main/apps/app_sentry/app_sentry.cpp)
 
-- `OWNER_IP` = phone's LAN IP (currently `192.168.66.199`; reserve in router for stability).
-- `probe_phone()` runs `etharp_find_addr` + `etharp_request` inside `esp_netif_tcpip_exec`
-  (thread-safe lwIP access; core-locking is off). Uses `netif_default` (the STA).
-  Returns SEEN / UNSEEN / NOWIFI.
-- Probe every `PROBE_MS` (15s); `AWAY_CONFIRM_MS` = 60s (real lag ~2–4 min w/ ARP aging).
+- `OWNER_IP` = phone's LAN IP (`192.168.66.184`; MAC randomization off → stable; reserve in
+  router for extra safety, MAC `c0:2f:cd:59:12:d5`).
+- A background `esp_ping` session (`PING_INTERVAL_MS` = 4s) pings the phone; the reply
+  callback stamps `_present_seen_ms`. `_wifi_ok` comes from `GetHAL().getWifiStatus()`.
+- `AWAY_CONFIRM_MS` = 90s → away ~1.5 min after the phone leaves; return is detected within
+  one ping (~4s).
+- WiFi must be brought up in the mooncake path (`Board::GetInstance().StartNetwork()`,
+  non-blocking) — it is not connected there otherwise.
 - Custom `sentry_font_48` provides the Chinese glyphs (stock font is a subset missing them).
 
 ## Out of scope / future
