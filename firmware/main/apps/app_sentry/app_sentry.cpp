@@ -12,38 +12,48 @@
 #include <smooth_lvgl.hpp>
 #include <stackchan/stackchan.h>
 #include <stackchan/motion/motion.h>
+#include <stackchan/avatar/avatar.h>
+#include <stackchan/modifiers/blink.h>
+#include <stackchan/modifiers/breath.h>
 #include "jpg/image_to_jpeg.h"
 #include <lvgl.h>
 #include <cstdio>
+#include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <math.h>
 
 #include <board.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "ping/ping_sock.h"
 extern "C" {
 #include "lwip/ip_addr.h"
 }
+
+// Telegram credentials live in a git-ignored header. If it's absent, Telegram push is
+// compiled out (the sentry still works, just logs the capture).
+#if __has_include("tg_secret.h")
+#include "tg_secret.h"
+#define HAVE_TG 1
+#endif
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
 
 static const char* TAG = "Sentry";
 
-// Custom 48px font (app_sentry/sentry_font_48.c) with exactly the glyphs this screen
-// shows. The stock font is a curated subset missing most of these characters.
+// Custom 48px font (app_sentry/sentry_font_48.c) with exactly the glyphs this screen shows.
 LV_FONT_DECLARE(sentry_font_48);
 
 // ---- Owner presence (WiFi) ----
-// The sentry only arms while the owner's phone is NOT on the office WiFi.
-// Set this to your phone's LAN IP (reserve it in the router for reliability).
 static const char* OWNER_IP = "192.168.66.184";
 
 // State messages (UTF-8). All glyphs are present in sentry_font_48.
 static const char* TXT_ARM    = "\xE5\xB8\x83\xE9\x98\xB2";                          // 布防
-static const char* TXT_GUARD  = "\xE7\x9B\x91\xE6\x8E\xA7\xE4\xB8\xAD";              // 监控中
 static const char* TXT_WARN   = "\xE9\x9D\x9E\xE8\xAF\xB7\xE5\x8B\xBF\xE5\x8A\xA8";  // 非请勿动
 static const char* TXT_COOL   = "\xE5\x86\xB7\xE5\x8D\xB4\xE4\xB8\xAD";              // 冷却中
-static const char* TXT_DISARM = "\xE5\xB7\xB2\xE6\x92\xA4\xE9\x98\xB2";              // 已撤防
 static const char* TXT_NOWIFI = "\xE7\xBD\x91\xE7\xBB\x9C\xE6\x96\xAD\xE5\xBC\x80";  // 网络断开
 
 // ---- Detection tunables ----
@@ -51,19 +61,16 @@ static const int MOTION_TRIG_PERMILLE   = 40;
 static const int MOTION_STRONG_PERMILLE = 150;
 static const int CONSECUTIVE_HITS       = 2;
 static const int PIX_THRESHOLD          = 18;
-static const uint32_t GRACE_MS          = 5000;   // arming countdown (leave the frame)
+static const uint32_t GRACE_MS          = 5000;
 static const uint32_t ALERT_MS          = 4000;
 static const uint32_t COOLDOWN_MS       = 15000;
 static const uint32_t CHECK_MS          = 100;
 
 // ---- Presence tunables ----
-// We ping the phone in the background (esp_ping). A reply refreshes "last seen"; no reply
-// for AWAY_CONFIRM_MS -> owner is away -> arm. ICMP gives fresh liveness (unlike ARP whose
-// cache lingers ~4 min), so away is detected quickly.
-static const uint32_t PING_INTERVAL_MS = 4000;   // background ping cadence
+static const uint32_t PING_INTERVAL_MS = 4000;
 static const uint32_t PING_TIMEOUT_MS  = 1500;
-static const uint32_t AWAY_CONFIRM_MS  = 90000;  // phone unseen this long -> "away" (~1.5 min)
-static const uint32_t LOG_MS           = 5000;   // presence debug log throttle
+static const uint32_t AWAY_CONFIRM_MS  = 30000;  // phone unseen this long -> "away" (~30 s)
+static const uint32_t LOG_MS           = 5000;
 
 // ---- Head-shake tunables ----
 static const int SHAKE_AMP          = 300;
@@ -73,11 +80,16 @@ static const uint32_t LED_FLASH_MS  = 250;
 
 enum SentryState { ST_NOWIFI, ST_DISARMED, ST_ARMING, ST_ARMED, ST_ALERTING, ST_COOLDOWN };
 enum PresenceCond { C_NOWIFI, C_PRESENT, C_AWAY };
+enum View { V_LABEL, V_AVATAR, V_DOT };
 
 static std::unique_ptr<Button> _btn_quit;
-static lv_obj_t* _scr        = nullptr;
-static lv_obj_t* _prev_scr   = nullptr;
-static lv_obj_t* _label_main = nullptr;
+static lv_obj_t* _scr           = nullptr;
+static lv_obj_t* _prev_scr      = nullptr;
+static lv_obj_t* _label_main    = nullptr;
+static lv_obj_t* _avatar_holder = nullptr;  // holds the StackChan face (shown when disarmed)
+static lv_obj_t* _dot           = nullptr;  // animated red "sentry eye" (shown when armed)
+static int _blink_id            = -1;
+static int _breath_id           = -1;
 static MotionDetector _md;
 static SentryState _state;
 static PresenceCond _cond;
@@ -90,13 +102,11 @@ static int _hits;
 static int _shake_dir;
 static uint32_t _shake_ms;
 
-// --- Owner presence via a background ICMP ping session ---
-// esp_ping runs in its own task; each reply stamps _present_seen_ms. The main loop reads
-// _wifi_ok (from the HAL) + _present_seen_ms to decide present / away.
+// ---- Owner presence via a background ICMP ping session ----
 static esp_ping_handle_t _ping_handle = nullptr;
 static bool _ping_started             = false;
+static bool _wifi_started             = false;
 
-// Runs in the esp_ping task context on each successful echo reply.
 static void on_ping_success(esp_ping_handle_t hdl, void* args)
 {
     _present_seen_ms = GetHAL().millis();
@@ -110,7 +120,7 @@ static void start_ping_session()
     }
     esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
     cfg.target_addr       = target;
-    cfg.count             = 0;  // 0 = infinite
+    cfg.count             = 0;  // infinite
     cfg.interval_ms       = PING_INTERVAL_MS;
     cfg.timeout_ms        = PING_TIMEOUT_MS;
 
@@ -123,11 +133,66 @@ static void start_ping_session()
     }
 }
 
-// WiFi is started once (async). WifiBoard::StartNetwork() is non-blocking — it kicks off the
-// connect and returns; getWifiStatus() tells us when the link is actually up.
-static bool _wifi_started = false;
+// ---- Telegram push (runs in a background task; TLS needs a big stack) ----
+static bool send_telegram_photo(const char* token, const char* chat_id, const uint8_t* jpg, size_t len)
+{
+    if (!token || !chat_id || !jpg || len == 0) return false;
 
-// --- LVGL helpers (call under LvglLockGuard) ---
+    std::string url  = std::string("https://api.telegram.org/bot") + token + "/sendPhoto";
+    auto network     = Board::GetInstance().GetNetwork();
+    auto http        = network->CreateHttp(0);
+    if (!http) return false;
+
+    std::string boundary = "----StackChanSentryBoundary";
+    http->SetTimeout(15000);
+    http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    http->SetHeader("Transfer-Encoding", "chunked");
+    if (!http->Open("POST", url)) {
+        http->Close();
+        return false;
+    }
+
+    std::string p1 = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
+                     chat_id + "\r\n";
+    http->Write(p1.c_str(), p1.size());
+
+    std::string p2 = "--" + boundary +
+                     "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"intruder.jpg\"\r\n"
+                     "Content-Type: image/jpeg\r\n\r\n";
+    http->Write(p2.c_str(), p2.size());
+
+    http->Write((const char*)jpg, len);
+
+    std::string p3 = "\r\n--" + boundary + "--\r\n";
+    http->Write(p3.c_str(), p3.size());
+    http->Write("", 0);  // chunked terminator
+
+    int status = http->GetStatusCode();
+    http->Close();
+    mclog::tagInfo(TAG, "telegram HTTP status {}", status);
+    return status == 200;
+}
+
+struct TgJob {
+    uint8_t* jpg;
+    size_t len;
+};
+static volatile bool _tg_busy = false;
+
+static void tg_send_task(void* arg)
+{
+    TgJob* job = static_cast<TgJob*>(arg);
+#ifdef HAVE_TG
+    bool ok = send_telegram_photo(TG_BOT_TOKEN, TG_CHAT_ID, job->jpg, job->len);
+    mclog::tagInfo(TAG, "telegram send: {}", ok ? "ok" : "FAILED");
+#endif
+    free(job->jpg);
+    delete job;
+    _tg_busy = false;
+    vTaskDelete(nullptr);
+}
+
+// ---- LVGL helpers (call under LvglLockGuard) ----
 static void set_main(const char* txt, uint32_t color)
 {
     if (_label_main) {
@@ -143,6 +208,36 @@ static void set_alert_bg(bool on)
     }
 }
 
+static void show_view(View v)
+{
+    auto vis = [](lv_obj_t* o, bool show) {
+        if (!o) return;
+        if (show)
+            lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    };
+    vis(_label_main, v == V_LABEL);
+    vis(_avatar_holder, v == V_AVATAR);
+    vis(_dot, v == V_DOT);
+}
+
+// Breathing red "sentry eye" — evil-robot glow. Call under LvglLockGuard when ST_ARMED.
+static void animate_dot(uint32_t now)
+{
+    if (!_dot) return;
+    float ph = (float)(now % 1800) / 1800.0f;
+    float s  = 0.5f - 0.5f * cosf(ph * 6.2831853f);  // 0..1..0 smooth
+    int diam = 46 + (int)(s * 40.0f);                // 46..86 px
+    int opa  = 110 + (int)(s * 145.0f);              // 110..255
+    int glow = 8 + (int)(s * 48.0f);                 // 8..56
+    lv_obj_set_size(_dot, diam, diam);
+    lv_obj_set_style_bg_opa(_dot, opa, 0);
+    lv_obj_set_style_shadow_width(_dot, glow, 0);
+    lv_obj_center(_dot);
+}
+
+// Capture the current camera frame as JPEG and push it to Telegram (background task).
 static void capture_intruder_photo()
 {
     auto* cam = hal_bridge::board_get_camera();
@@ -156,10 +251,24 @@ static void capture_intruder_photo()
 
     uint8_t* jpg = nullptr;
     size_t jlen  = 0;
-    if (image_to_jpeg((uint8_t*)data, sz, w, h, (v4l2_pix_fmt_t)fmt, 80, &jpg, &jlen) && jpg) {
-        mclog::tagInfo(TAG, "captured intruder photo: {} bytes (Telegram upload = Phase B3)", (int)jlen);
-        free(jpg);
+    if (!image_to_jpeg((uint8_t*)data, sz, w, h, (v4l2_pix_fmt_t)fmt, 80, &jpg, &jlen) || !jpg) {
+        return;
     }
+    mclog::tagInfo(TAG, "captured intruder photo: {} bytes", (int)jlen);
+
+#ifdef HAVE_TG
+    if (!_tg_busy) {
+        _tg_busy   = true;
+        TgJob* job = new TgJob{jpg, jlen};
+        // TLS handshake is stack-heavy -> generous stack; task frees the JPEG.
+        if (xTaskCreate(tg_send_task, "tg_send", 24576, job, 4, nullptr) == pdPASS) {
+            return;  // task owns jpg now
+        }
+        delete job;
+        _tg_busy = false;
+    }
+#endif
+    free(jpg);
 }
 
 static void alert_motion_begin()
@@ -201,6 +310,7 @@ void AppSentry::onOpen()
         lv_obj_set_style_bg_color(_scr, lv_color_hex(0x000000), 0);
         lv_obj_set_style_pad_all(_scr, 0, 0);
 
+        // (a) Text status message (network/arming/warning/cooldown).
         _label_main = lv_label_create(_scr);
         lv_obj_set_style_text_font(_label_main, &sentry_font_48, 0);
         lv_obj_set_style_text_align(_label_main, LV_TEXT_ALIGN_CENTER, 0);
@@ -208,18 +318,50 @@ void AppSentry::onOpen()
         lv_obj_set_style_text_color(_label_main, lv_color_hex(0xFF8800), 0);
         lv_label_set_text(_label_main, TXT_NOWIFI);
 
+        // (b) The normal StackChan face (shown when disarmed / owner present).
+        _avatar_holder = lv_obj_create(_scr);
+        lv_obj_remove_flag(_avatar_holder, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(_avatar_holder, 320, 240);
+        lv_obj_center(_avatar_holder);
+        lv_obj_set_style_bg_opa(_avatar_holder, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(_avatar_holder, 0, 0);
+        lv_obj_set_style_pad_all(_avatar_holder, 0, 0);
+        lv_obj_add_flag(_avatar_holder, LV_OBJ_FLAG_HIDDEN);
+
+        // (c) Animated red "sentry eye" (shown when armed / monitoring).
+        _dot = lv_obj_create(_scr);
+        lv_obj_remove_flag(_dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(_dot, 60, 60);
+        lv_obj_center(_dot);
+        lv_obj_set_style_radius(_dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(_dot, lv_color_hex(0xFF1010), 0);
+        lv_obj_set_style_border_width(_dot, 0, 0);
+        lv_obj_set_style_shadow_color(_dot, lv_color_hex(0xFF0000), 0);
+        lv_obj_set_style_shadow_width(_dot, 30, 0);
+        lv_obj_add_flag(_dot, LV_OBJ_FLAG_HIDDEN);
+
         _btn_quit = std::make_unique<Button>(_scr);
         _btn_quit->setAlign(LV_ALIGN_BOTTOM_MID);
         _btn_quit->label().setText("EXIT");
         _btn_quit->onClick().connect([this]() { close(); });
 
+        // The StackChan face + its blink/breathe animation.
+        if (!GetStackChan().hasAvatar()) {
+            auto avatar = std::make_unique<stackchan::avatar::DefaultAvatar>();
+            avatar->init(_avatar_holder);
+            GetStackChan().attachAvatar(std::move(avatar));
+            _breath_id = GetStackChan().addModifier(std::make_unique<stackchan::BreathModifier>());
+            _blink_id  = GetStackChan().addModifier(std::make_unique<stackchan::BlinkModifier>());
+        }
+
+        show_view(V_LABEL);
         lv_screen_load(_scr);
     }
 
     // Keep the head still & under our control (no idle drift moving the camera).
     GetStackChan().motion().setModifyLock(true);
 
-    // Bring WiFi up (needed for presence detection AND the future Telegram push).
+    // Bring WiFi up (needed for presence detection AND the Telegram push).
     if (!_wifi_started) {
         _wifi_started = true;
         Board::GetInstance().StartNetwork();  // non-blocking; connects via WiFi events
@@ -231,8 +373,6 @@ void AppSentry::onOpen()
     _hits            = 0;
     _last_check_ms   = 0;
     _last_probe_ms   = 0;
-    // WiFi is not up yet at boot -> start in NOWIFI. Once connected, assume the owner is
-    // present (won't arm until the phone is actually confirmed absent).
     _wifi_ok         = false;
     _present_seen_ms = GetHAL().millis();
     _cond            = C_NOWIFI;
@@ -253,10 +393,10 @@ void AppSentry::onRunning()
         }
     }
 
-    // (2) Pump the servo animation.
+    // (2) Pump servo + avatar animation.
     GetStackChan().update();
 
-    // (3) While alerting: blink LED + step head shake.
+    // (3) Per-state animations.
     if (_state == ST_ALERTING) {
         bool led_on = ((now - _state_ms) / LED_FLASH_MS) % 2 == 0;
         GetHAL().showRgbColor(led_on ? 255 : 0, 0, 0);
@@ -265,12 +405,20 @@ void AppSentry::onRunning()
             _shake_dir = -_shake_dir;
             GetStackChan().motion().moveYawWithSpeed(_shake_dir * SHAKE_AMP, SHAKE_SPEED);
         }
+    } else if (_state == ST_ARMED) {
+        static uint32_t _last_dot_ms = 0;
+        if (now - _last_dot_ms >= 40) {  // ~25 fps; don't invalidate LVGL every loop
+            _last_dot_ms = now;
+            LvglLockGuard lock;
+            animate_dot(now);
+        }
     }
 
     // (4) Presence: WiFi status + background-ping freshness.
     _wifi_ok = (GetHAL().getWifiStatus() != WifiStatus::None);
     if (_wifi_ok && !_ping_started) {
         _ping_started = true;
+        GetHAL().startSntp();  // correct system time for TLS (RTC already gives a baseline)
         start_ping_session();
     }
     if (now - _last_probe_ms >= LOG_MS) {
@@ -279,7 +427,7 @@ void AppSentry::onRunning()
                        (int)((now - _present_seen_ms) / 1000));
     }
 
-    // (5) Outer presence gate: NOWIFI / PRESENT(disarmed) / AWAY(run detection).
+    // (5) Outer presence gate.
     PresenceCond cond;
     if (!_wifi_ok) {
         cond = C_NOWIFI;
@@ -297,21 +445,23 @@ void AppSentry::onRunning()
             set_alert_bg(false);
             if (cond == C_NOWIFI) {
                 _state = ST_NOWIFI;
+                show_view(V_LABEL);
                 set_main(TXT_NOWIFI, 0xFF8800);
             } else if (cond == C_PRESENT) {
                 _state = ST_DISARMED;
-                set_main(TXT_DISARM, 0x888888);
-            } else {  // C_AWAY -> begin arming
+                show_view(V_AVATAR);  // normal StackChan face, no text
+            } else {                  // C_AWAY -> begin arming
                 _state    = ST_ARMING;
                 _state_ms = now;
                 _hits     = 0;
+                show_view(V_LABEL);
                 set_main(TXT_ARM, 0xFFAA00);
             }
         }
         if (cond == C_AWAY) {
             _md.reset();
         } else {
-            GetHAL().showRgbColor(0, 0, 0);  // leaving armed flow: LEDs off
+            GetHAL().showRgbColor(0, 0, 0);
             if (was_alerting) alert_motion_end();
         }
     }
@@ -351,7 +501,7 @@ void AppSentry::onRunning()
             if (now - _state_ms > GRACE_MS) {
                 _state = ST_ARMED;
                 _hits  = 0;
-                set_main(TXT_GUARD, 0x33FF66);
+                show_view(V_DOT);
             } else {
                 char buf[20];
                 snprintf(buf, sizeof(buf), "%s %lu", TXT_ARM,
@@ -373,6 +523,7 @@ void AppSentry::onRunning()
                 _state      = ST_ALERTING;
                 _state_ms   = now;
                 enter_alert = true;
+                show_view(V_LABEL);
                 set_main(TXT_WARN, 0xFFFFFF);
                 set_alert_bg(true);
                 mclog::tagInfo(TAG, "ALERT: motion={}permille", mp);
@@ -385,6 +536,7 @@ void AppSentry::onRunning()
                 _state_ms  = now;
                 exit_alert = true;
                 set_alert_bg(false);
+                show_view(V_LABEL);
                 set_main(TXT_COOL, 0xAAAAAA);
             }
             break;
@@ -393,7 +545,7 @@ void AppSentry::onRunning()
             if (now - _state_ms > COOLDOWN_MS) {
                 _state = ST_ARMED;
                 _md.reset();
-                set_main(TXT_GUARD, 0x33FF66);
+                show_view(V_DOT);
             }
             break;
         }
@@ -423,6 +575,16 @@ void AppSentry::onClose()
     m.setModifyLock(false);
     m.goHome(400);
 
+    if (_blink_id >= 0) {
+        GetStackChan().removeModifier(_blink_id);
+        _blink_id = -1;
+    }
+    if (_breath_id >= 0) {
+        GetStackChan().removeModifier(_breath_id);
+        _breath_id = -1;
+    }
+    GetStackChan().resetAvatar();
+
     LvglLockGuard lock;
     if (_prev_scr) {
         lv_screen_load(_prev_scr);
@@ -433,5 +595,7 @@ void AppSentry::onClose()
         lv_obj_del(_scr);
         _scr = nullptr;
     }
-    _label_main = nullptr;
+    _label_main    = nullptr;
+    _avatar_holder = nullptr;
+    _dot           = nullptr;
 }
