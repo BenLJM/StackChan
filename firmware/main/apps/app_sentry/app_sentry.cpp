@@ -12,9 +12,6 @@
 #include <smooth_lvgl.hpp>
 #include <stackchan/stackchan.h>
 #include <stackchan/motion/motion.h>
-#include <stackchan/avatar/avatar.h>
-#include <stackchan/modifiers/blink.h>
-#include <stackchan/modifiers/breath.h>
 #include "jpg/image_to_jpeg.h"
 #include <lvgl.h>
 #include <cstdio>
@@ -86,10 +83,11 @@ static std::unique_ptr<Button> _btn_quit;
 static lv_obj_t* _scr           = nullptr;
 static lv_obj_t* _prev_scr      = nullptr;
 static lv_obj_t* _label_main    = nullptr;
-static lv_obj_t* _avatar_holder = nullptr;  // holds the StackChan face (shown when disarmed)
-static lv_obj_t* _dot           = nullptr;  // animated red "sentry eye" (shown when armed)
-static int _blink_id            = -1;
-static int _breath_id           = -1;
+static lv_obj_t* _face   = nullptr;  // StackChan face container (shown when disarmed)
+static lv_obj_t* _eye_l  = nullptr;
+static lv_obj_t* _eye_r  = nullptr;
+static lv_obj_t* _mouth  = nullptr;
+static lv_obj_t* _dot    = nullptr;  // animated red "sentry eye" (shown when armed)
 static MotionDetector _md;
 static SentryState _state;
 static PresenceCond _cond;
@@ -218,8 +216,20 @@ static void show_view(View v)
             lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
     };
     vis(_label_main, v == V_LABEL);
-    vis(_avatar_holder, v == V_AVATAR);
+    vis(_face, v == V_AVATAR);
     vis(_dot, v == V_DOT);
+}
+
+// Cute StackChan-style blink. Call under LvglLockGuard when ST_DISARMED.
+static void animate_face(uint32_t now)
+{
+    if (!_eye_l || !_eye_r) return;
+    bool blink = (now % 3600) < 130;  // quick blink every 3.6 s
+    int h      = blink ? 6 : 46;
+    lv_obj_set_height(_eye_l, h);
+    lv_obj_set_height(_eye_r, h);
+    lv_obj_align(_eye_l, LV_ALIGN_CENTER, -50, -14);
+    lv_obj_align(_eye_r, LV_ALIGN_CENTER, 50, -14);
 }
 
 // Breathing red "sentry eye" — evil-robot glow. Call under LvglLockGuard when ST_ARMED.
@@ -318,15 +328,30 @@ void AppSentry::onOpen()
         lv_obj_set_style_text_color(_label_main, lv_color_hex(0xFF8800), 0);
         lv_label_set_text(_label_main, TXT_NOWIFI);
 
-        // (b) The normal StackChan face (shown when disarmed / owner present).
-        _avatar_holder = lv_obj_create(_scr);
-        lv_obj_remove_flag(_avatar_holder, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(_avatar_holder, 320, 240);
-        lv_obj_center(_avatar_holder);
-        lv_obj_set_style_bg_opa(_avatar_holder, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(_avatar_holder, 0, 0);
-        lv_obj_set_style_pad_all(_avatar_holder, 0, 0);
-        lv_obj_add_flag(_avatar_holder, LV_OBJ_FLAG_HIDDEN);
+        // (b) The StackChan face (shown when disarmed / owner present): two white eyes +
+        //     a mouth on black, drawn directly so it always renders. Blinks via animate_face().
+        _face = lv_obj_create(_scr);
+        lv_obj_remove_flag(_face, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(_face, 320, 240);
+        lv_obj_center(_face);
+        lv_obj_set_style_bg_color(_face, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_border_width(_face, 0, 0);
+        lv_obj_set_style_pad_all(_face, 0, 0);
+
+        auto make_white = [&](int w, int h, int rad, int dx, int dy) {
+            lv_obj_t* o = lv_obj_create(_face);
+            lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_size(o, w, h);
+            lv_obj_set_style_radius(o, rad, 0);
+            lv_obj_set_style_bg_color(o, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_border_width(o, 0, 0);
+            lv_obj_align(o, LV_ALIGN_CENTER, dx, dy);
+            return o;
+        };
+        _eye_l = make_white(40, 46, 12, -50, -14);
+        _eye_r = make_white(40, 46, 12, 50, -14);
+        _mouth = make_white(70, 12, 6, 0, 52);
+        lv_obj_add_flag(_face, LV_OBJ_FLAG_HIDDEN);
 
         // (c) Animated red "sentry eye" (shown when armed / monitoring).
         _dot = lv_obj_create(_scr);
@@ -344,15 +369,6 @@ void AppSentry::onOpen()
         _btn_quit->setAlign(LV_ALIGN_BOTTOM_MID);
         _btn_quit->label().setText("EXIT");
         _btn_quit->onClick().connect([this]() { close(); });
-
-        // The StackChan face + its blink/breathe animation.
-        if (!GetStackChan().hasAvatar()) {
-            auto avatar = std::make_unique<stackchan::avatar::DefaultAvatar>();
-            avatar->init(_avatar_holder);
-            GetStackChan().attachAvatar(std::move(avatar));
-            _breath_id = GetStackChan().addModifier(std::make_unique<stackchan::BreathModifier>());
-            _blink_id  = GetStackChan().addModifier(std::make_unique<stackchan::BlinkModifier>());
-        }
 
         show_view(V_LABEL);
         lv_screen_load(_scr);
@@ -411,6 +427,13 @@ void AppSentry::onRunning()
             _last_dot_ms = now;
             LvglLockGuard lock;
             animate_dot(now);
+        }
+    } else if (_state == ST_DISARMED) {
+        static uint32_t _last_face_ms = 0;
+        if (now - _last_face_ms >= 40) {
+            _last_face_ms = now;
+            LvglLockGuard lock;
+            animate_face(now);
         }
     }
 
@@ -575,16 +598,6 @@ void AppSentry::onClose()
     m.setModifyLock(false);
     m.goHome(400);
 
-    if (_blink_id >= 0) {
-        GetStackChan().removeModifier(_blink_id);
-        _blink_id = -1;
-    }
-    if (_breath_id >= 0) {
-        GetStackChan().removeModifier(_breath_id);
-        _breath_id = -1;
-    }
-    GetStackChan().resetAvatar();
-
     LvglLockGuard lock;
     if (_prev_scr) {
         lv_screen_load(_prev_scr);
@@ -592,10 +605,13 @@ void AppSentry::onClose()
     }
     _btn_quit.reset();
     if (_scr) {
-        lv_obj_del(_scr);
+        lv_obj_del(_scr);  // deletes the face/eyes/mouth/dot/label children too
         _scr = nullptr;
     }
-    _label_main    = nullptr;
-    _avatar_holder = nullptr;
-    _dot           = nullptr;
+    _label_main = nullptr;
+    _face       = nullptr;
+    _eye_l      = nullptr;
+    _eye_r      = nullptr;
+    _mouth      = nullptr;
+    _dot        = nullptr;
 }
