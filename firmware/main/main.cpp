@@ -9,6 +9,7 @@
 #include <mooncake.h>
 #include <apps/apps.h>
 #include <hal/hal.h>
+#include "apps/app_sentry/sentry_selftest.h"
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -38,7 +39,16 @@ extern "C" void app_main(void)
         GetMooncake().installApp(std::make_unique<AppAppCenter>());
         GetMooncake().installApp(std::make_unique<AppEzdata>());
         GetMooncake().installApp(std::make_unique<AppDance>());
+        int sentry_app_id = GetMooncake().installApp(std::make_unique<AppSentry>());
         GetMooncake().installApp(std::make_unique<AppSetup>());
+
+#ifdef SENTRY_AUTOSTART
+        // No touchscreen access when remote — auto-open the Sentry app at boot so it
+        // self-arms on power-up (also sensible default behavior for a security device).
+        GetMooncake().openApp(sentry_app_id);
+#else
+        (void)sentry_app_id;
+#endif
 
         // Main loop
         while (1) {

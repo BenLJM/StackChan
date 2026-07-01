@@ -65,3 +65,6 @@ sdkconfig
 sdkconfig.old
 
 xiaozhi-esp32/
+
+# Secrets — never commit
+main/apps/app_sentry/tg_secret.h

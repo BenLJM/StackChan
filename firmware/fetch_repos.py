@@ -30,11 +30,17 @@ def clone_or_update_repo(
             else os.path.join(os.getcwd(), patch_path)
         )
         # 使用 git apply --check 先检测补丁是否能应用，避免报错
+        # --ignore-whitespace: on Windows (core.autocrlf=true) the working tree is
+        # CRLF while the patch is LF, which makes a plain `git apply` fail with
+        # "patch does not apply"; ignoring whitespace lets it apply cleanly.
         check_result = subprocess.run(
-            ["git", "-C", path, "apply", "--check", patch_full_path]
+            ["git", "-C", path, "apply", "--check", "--ignore-whitespace", patch_full_path]
         )
         if check_result.returncode == 0:
-            subprocess.run(["git", "-C", path, "apply", patch_full_path], check=True)
+            subprocess.run(
+                ["git", "-C", path, "apply", "--ignore-whitespace", patch_full_path],
+                check=True,
+            )
             print(f"Applied patch {patch_path} to {path}")
         else:
             print(f"Patch {patch_path} cannot be applied cleanly to {path}, skipped.")
