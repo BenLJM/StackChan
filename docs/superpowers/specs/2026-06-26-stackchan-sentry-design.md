@@ -1,5 +1,7 @@
 # StackChan 哨兵模式 (Sentry Mode) 设计规格
 
+> **[SUPERSEDED — 设计阶段文档]** 实际实现已偏离本设计：**放弃了 esp-dl 人脸检测**（该构建下盒坐标解码有缺陷），改用**摄像头帧差运动检测**；并新增了"在场感知布防"。以实现为准的说明见 **[docs/sentry-mode.md](../../sentry-mode.md)**。本文件仅作设计历史留存。
+
 - 日期: 2026-06-26
 - 分支: `feature/sentry-mode`
 - 设备: M5Stack StackChan (CoreS3 / ESP32-S3)
