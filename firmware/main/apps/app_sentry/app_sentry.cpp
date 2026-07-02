@@ -5,6 +5,8 @@
  */
 #include "app_sentry.h"
 #include "motion_detect.h"
+#include "person_detect.h"
+#include <esp_heap_caps.h>
 #include <hal/hal.h>
 #include <hal/board/hal_bridge.h>
 #include <mooncake.h>
@@ -63,6 +65,16 @@ static const uint32_t ALERT_MS          = 4000;
 static const uint32_t COOLDOWN_MS       = 15000;
 static const uint32_t CHECK_MS          = 100;
 
+// ---- Person verification tunables ----
+// Motion alone no longer fires the alert: it opens a VERIFY window during which the
+// TFLM person classifier must confirm a human. The photo sent is the highest-scoring
+// frame ("best shot"), not whatever was in the buffer at the motion instant.
+static const int PERSON_THRESH_PCT = 55;    // person score (%) to confirm an intruder
+static const int PERSON_GREAT_PCT  = 85;    // good enough to stop hunting a better shot
+static const uint32_t VERIFY_MS    = 5000;  // max hunt for a person after motion
+static const uint32_t IMPROVE_MS   = 1500;  // after confirm, keep hunting a better shot
+static const uint32_t INFER_GAP_MS = 350;   // min gap between inferences (each ~0.5 s)
+
 // ---- Presence tunables ----
 static const uint32_t PING_INTERVAL_MS = 4000;
 static const uint32_t PING_TIMEOUT_MS  = 1500;
@@ -75,7 +87,7 @@ static const int SHAKE_SPEED        = 900;
 static const uint32_t SHAKE_HALF_MS = 150;
 static const uint32_t LED_FLASH_MS  = 250;
 
-enum SentryState { ST_NOWIFI, ST_DISARMED, ST_ARMING, ST_ARMED, ST_ALERTING, ST_COOLDOWN };
+enum SentryState { ST_NOWIFI, ST_DISARMED, ST_ARMING, ST_ARMED, ST_VERIFY, ST_ALERTING, ST_COOLDOWN };
 enum PresenceCond { C_NOWIFI, C_PRESENT, C_AWAY };
 enum View { V_LABEL, V_AVATAR, V_DOT };
 
@@ -99,6 +111,18 @@ static bool _wifi_ok;
 static int _hits;
 static int _shake_dir;
 static uint32_t _shake_ms;
+
+// ---- Person-verify state (best-shot buffer lives in PSRAM) ----
+static const size_t FRAME_MAX  = 320 * 240 * 2;  // YUYV frame size
+static uint8_t* _best_frame    = nullptr;
+static size_t _best_len        = 0;
+static int _best_w             = 0;
+static int _best_h             = 0;
+static int _best_fmt           = 0;
+static int _best_score         = -1;
+static uint32_t _confirm_ms    = 0;  // when a person was confirmed (0 = not yet)
+static uint32_t _last_infer_ms = 0;
+static bool _pd_ok             = false;  // person model usable? (else fall back to motion-only)
 
 // ---- Owner presence via a background ICMP ping session ----
 static esp_ping_handle_t _ping_handle = nullptr;
@@ -247,24 +271,30 @@ static void animate_dot(uint32_t now)
     lv_obj_center(_dot);
 }
 
-// Capture the current camera frame as JPEG and push it to Telegram (background task).
-static void capture_intruder_photo()
+// Encode the best person-frame (fallback: live frame) as JPEG and push it to Telegram.
+static void send_best_photo()
 {
-    auto* cam = hal_bridge::board_get_camera();
-    if (!cam) return;
-    const uint8_t* data = cam->GetFrameData();
-    int w               = cam->GetFrameWidth();
-    int h               = cam->GetFrameHeight();
-    int fmt             = cam->GetFrameFormat();
-    size_t sz           = cam->GetFrameSize();
-    if (!data || w <= 0 || h <= 0) return;
+    const uint8_t* data = _best_frame;
+    size_t sz           = _best_len;
+    int w = _best_w, h = _best_h, fmt = _best_fmt;
+
+    if (!data || sz == 0) {  // shouldn't happen, but never send nothing
+        auto* cam = hal_bridge::board_get_camera();
+        if (!cam) return;
+        data = cam->GetFrameData();
+        sz   = cam->GetFrameSize();
+        w    = cam->GetFrameWidth();
+        h    = cam->GetFrameHeight();
+        fmt  = cam->GetFrameFormat();
+        if (!data || w <= 0 || h <= 0) return;
+    }
 
     uint8_t* jpg = nullptr;
     size_t jlen  = 0;
     if (!image_to_jpeg((uint8_t*)data, sz, w, h, (v4l2_pix_fmt_t)fmt, 80, &jpg, &jlen) || !jpg) {
         return;
     }
-    mclog::tagInfo(TAG, "captured intruder photo: {} bytes", (int)jlen);
+    mclog::tagInfo(TAG, "intruder photo: {} bytes (person {}%)", (int)jlen, _best_score);
 
 #ifdef HAVE_TG
     if (!_tg_busy) {
@@ -389,6 +419,9 @@ void AppSentry::onOpen()
     _hits            = 0;
     _last_check_ms   = 0;
     _last_probe_ms   = 0;
+    _confirm_ms      = 0;
+    _best_score      = -1;
+    _best_len        = 0;
     _wifi_ok         = false;
     _present_seen_ms = GetHAL().millis();
     _cond            = C_NOWIFI;
@@ -412,8 +445,10 @@ void AppSentry::onRunning()
     // (2) Pump servo + avatar animation.
     GetStackChan().update();
 
-    // (3) Per-state animations.
-    if (_state == ST_ALERTING) {
+    // (3) Per-state animations. The alert (LED + shake) also runs while a confirmed
+    // person is still in the VERIFY improve-window.
+    bool alert_active = (_state == ST_ALERTING) || (_state == ST_VERIFY && _confirm_ms != 0);
+    if (alert_active) {
         bool led_on = ((now - _state_ms) / LED_FLASH_MS) % 2 == 0;
         GetHAL().showRgbColor(led_on ? 255 : 0, 0, 0);
         if (now - _shake_ms >= SHAKE_HALF_MS) {
@@ -421,7 +456,7 @@ void AppSentry::onRunning()
             _shake_dir = -_shake_dir;
             GetStackChan().motion().moveYawWithSpeed(_shake_dir * SHAKE_AMP, SHAKE_SPEED);
         }
-    } else if (_state == ST_ARMED) {
+    } else if (_state == ST_ARMED || _state == ST_VERIFY) {
         static uint32_t _last_dot_ms = 0;
         if (now - _last_dot_ms >= 40) {  // ~25 fps; don't invalidate LVGL every loop
             _last_dot_ms = now;
@@ -446,23 +481,29 @@ void AppSentry::onRunning()
     }
     if (now - _last_probe_ms >= LOG_MS) {
         _last_probe_ms = now;
-        mclog::tagInfo(TAG, "presence: wifi={} last_reply={}s_ago", _wifi_ok,
-                       (int)((now - _present_seen_ms) / 1000));
+        int32_t ago = (int32_t)(now - _present_seen_ms);
+        if (ago < 0) ago = 0;
+        mclog::tagInfo(TAG, "presence: wifi={} last_reply={}s_ago", _wifi_ok, (int)(ago / 1000));
     }
 
     // (5) Outer presence gate.
     PresenceCond cond;
+    // Signed delta: the ping callback (another task) may stamp _present_seen_ms AFTER
+    // `now` was read this loop — unsigned math would underflow to ~4e9 and flash "away".
+    int32_t unseen_ms = (int32_t)(now - _present_seen_ms);
+    if (unseen_ms < 0) unseen_ms = 0;
     if (!_wifi_ok) {
         cond = C_NOWIFI;
-    } else if (now - _present_seen_ms < AWAY_CONFIRM_MS) {
+    } else if ((uint32_t)unseen_ms < AWAY_CONFIRM_MS) {
         cond = C_PRESENT;
     } else {
         cond = C_AWAY;
     }
 
     if (cond != _cond) {
-        bool was_alerting = (_state == ST_ALERTING);
+        bool was_alerting = (_state == ST_ALERTING) || (_state == ST_VERIFY && _confirm_ms != 0);
         _cond             = cond;
+        _confirm_ms       = 0;
         {
             LvglLockGuard lock;
             set_alert_bg(false);
@@ -483,6 +524,10 @@ void AppSentry::onRunning()
         }
         if (cond == C_AWAY) {
             _md.reset();
+            _pd_ok = person_detect_init();  // lazy: model + arena only when actually arming
+            if (!_pd_ok) {
+                mclog::tagWarn(TAG, "person model unavailable -> motion-only alerts");
+            }
         } else {
             GetHAL().showRgbColor(0, 0, 0);
             if (was_alerting) alert_motion_end();
@@ -500,20 +545,52 @@ void AppSentry::onRunning()
     }
     _last_check_ms = now;
 
-    int mp    = 0;
-    bool have = false;
-    auto* cam = hal_bridge::board_get_camera();
+    int mp               = 0;
+    bool have            = false;
+    const uint8_t* fdata = nullptr;
+    int fw = 0, fh = 0, ffmt = 0;
+    size_t flen = 0;
+    auto* cam   = hal_bridge::board_get_camera();
     if (cam && cam->StreamCaptures()) {
-        const uint8_t* data = cam->GetFrameData();
-        int w               = cam->GetFrameWidth();
-        int h               = cam->GetFrameHeight();
-        if (data && w > 0 && h > 0 && _md.update(data, w, h)) {
+        fdata = cam->GetFrameData();
+        fw    = cam->GetFrameWidth();
+        fh    = cam->GetFrameHeight();
+        ffmt  = cam->GetFrameFormat();
+        flen  = cam->GetFrameSize();
+        if (fdata && fw > 0 && fh > 0 && _md.update(fdata, fw, fh)) {
             mp   = _md.motionPermille();
             have = _md.hasPrev();
         }
     }
 
+    // While verifying: ask the person classifier (blocking ~0.5 s — done OUTSIDE the
+    // LVGL lock so rendering never stalls). Keep a copy of the best-scoring frame.
+    int person = -1;
+    if (_state == ST_VERIFY) {
+        if (!_pd_ok) {
+            person = 100;  // model unavailable -> behave like the old motion-only sentry
+        } else if (fdata && now - _last_infer_ms >= INFER_GAP_MS) {
+            _last_infer_ms = now;
+            person         = person_detect_score(fdata, fw, fh);
+            mclog::tagInfo(TAG, "person score: {}% (best {}%)", person, _best_score);
+            if (person > _best_score && flen > 0 && flen <= FRAME_MAX) {
+                if (!_best_frame) {
+                    _best_frame = (uint8_t*)heap_caps_malloc(FRAME_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                }
+                if (_best_frame) {
+                    memcpy(_best_frame, fdata, flen);
+                    _best_len   = flen;
+                    _best_w     = fw;
+                    _best_h     = fh;
+                    _best_fmt   = ffmt;
+                    _best_score = person;
+                }
+            }
+        }
+    }
+
     bool enter_alert = false;
+    bool send_best   = false;
     bool exit_alert  = false;
 
     {
@@ -542,14 +619,41 @@ void AppSentry::onRunning()
                 _hits = 0;
             }
             if (_hits >= CONSECUTIVE_HITS) {
-                _hits       = 0;
-                _state      = ST_ALERTING;
-                _state_ms   = now;
+                // Motion is only the wake-up: a person must be confirmed before alerting.
+                _hits          = 0;
+                _state         = ST_VERIFY;
+                _state_ms      = now;
+                _confirm_ms    = 0;
+                _best_score    = -1;
+                _best_len      = 0;
+                _last_infer_ms = 0;
+                mclog::tagInfo(TAG, "motion={}permille -> verifying person", mp);
+            }
+            break;
+        }
+        case ST_VERIFY: {
+            if (person >= PERSON_THRESH_PCT && _confirm_ms == 0) {
+                // Person confirmed: fire the deterrence NOW; the photo keeps improving
+                // for IMPROVE_MS more, then the best shot is sent.
+                _confirm_ms = now;
                 enter_alert = true;
                 show_view(V_LABEL);
                 set_main(TXT_WARN, 0xFFFFFF);
                 set_alert_bg(true);
-                mclog::tagInfo(TAG, "ALERT: motion={}permille", mp);
+                mclog::tagInfo(TAG, "ALERT: person confirmed ({}%)", person);
+            }
+            if (_confirm_ms != 0) {
+                if (now - _confirm_ms >= IMPROVE_MS || _best_score >= PERSON_GREAT_PCT) {
+                    send_best = true;
+                    _state    = ST_ALERTING;
+                    _state_ms = _confirm_ms;  // alert window counts from confirmation
+                }
+            } else if (now - _state_ms > VERIFY_MS) {
+                mclog::tagInfo(TAG, "no person within {}s -> rearm (no alert, no photo)",
+                               (int)(VERIFY_MS / 1000));
+                _state = ST_ARMED;
+                _hits  = 0;
+                _md.reset();
             }
             break;
         }
@@ -580,7 +684,9 @@ void AppSentry::onRunning()
     if (enter_alert) {
         GetHAL().showRgbColor(255, 0, 0);
         alert_motion_begin();
-        capture_intruder_photo();
+    }
+    if (send_best) {
+        send_best_photo();  // JPEG-encode the best person-frame; Telegram runs in its own task
     }
     if (exit_alert) {
         GetHAL().showRgbColor(0, 0, 0);
@@ -597,6 +703,12 @@ void AppSentry::onClose()
     m.setAutoTorqueReleaseEnabled(true);
     m.setModifyLock(false);
     m.goHome(400);
+
+    if (_best_frame) {
+        heap_caps_free(_best_frame);
+        _best_frame = nullptr;
+        _best_len   = 0;
+    }
 
     LvglLockGuard lock;
     if (_prev_scr) {

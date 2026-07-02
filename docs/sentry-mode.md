@@ -10,7 +10,7 @@ photo to your phone via Telegram. When you're home it behaves like a normal Stac
 |---|---|---|---|
 | **Home** | your phone is on the office WiFi | StackChan face (blinking eyes) | No — disarmed |
 | **Away** | phone absent from WiFi ~30 s | breathing red "sentry eye" | Yes — armed |
-| **Intruder** | motion while armed | red screen 「非请勿动」 + head-shake + red LED flash | Captures photo → Telegram |
+| **Intruder** | motion wakes it, then the **person classifier confirms a human** | red screen 「非请勿动」 + head-shake + red LED flash | Sends the **best person-frame** → Telegram |
 
 Returning home (phone rejoins WiFi) disarms within ~5 s and stops any active alert.
 
@@ -23,9 +23,15 @@ Returning home (phone rejoins WiFi) disarms within ~5 s and stops any active ale
 - **WiFi** — the mooncake/launcher boot path does **not** connect WiFi (only the xiaozhi AI
   path does), so the app calls `Board::GetInstance().StartNetwork()` (non-blocking) in
   `onOpen`, then reads `GetHAL().getWifiStatus()`.
-- **Intruder detection** — camera frame-difference motion (`motion_detect.{h,cpp}`): YUYV
-  luma on a 40×30 grid, count cells changed > threshold, trigger on permille ≥ threshold for
-  N consecutive samples (or one strong spike). Auto-arms on boot (`SENTRY_AUTOSTART`).
+- **Intruder detection (two-stage)** — cheap frame-difference motion (`motion_detect.{h,cpp}`,
+  YUYV luma on a 40×30 grid) only *wakes* the pipeline. A VERIFY window (≤ `VERIFY_MS`) then
+  runs the **TFLite-Micro `person_detect` classifier** (`person_detect.{h,cpp}` + embedded
+  96×96 grayscale model, ~300 KB) every ~0.4 s: no person ⇒ silently re-arm (curtains, pets
+  and light changes never alert); person confirmed ⇒ alert fires and the highest-scoring
+  frame within `IMPROVE_MS` becomes the photo (**best shot**, not the motion-instant frame).
+  The classifier is independent of esp-dl (whose face-detect box-decode is broken on this
+  build); if the model fails to init the sentry degrades to motion-only alerts.
+  Auto-arms on boot (`SENTRY_AUTOSTART`).
 - **Alert** — head-shake via the servo (torque forced on; motion modifiers locked), RGB LED
   flash, on-screen warning, JPEG capture (`image_to_jpeg`), and a Telegram `sendPhoto`
   multipart upload run in a **background task** (24 KB stack for the TLS handshake — the main
@@ -55,8 +61,10 @@ Build from a short path (long Windows paths overflow the command-line limit duri
 ## Tunables (top of `app_sentry.cpp`)
 
 `AWAY_CONFIRM_MS` (away lag), `MOTION_TRIG_PERMILLE` / `MOTION_STRONG_PERMILLE` /
-`PIX_THRESHOLD` (motion sensitivity), `GRACE_MS` / `ALERT_MS` / `COOLDOWN_MS` (timing),
-`SHAKE_AMP` / `SHAKE_SPEED` (head shake), `PING_INTERVAL_MS`.
+`PIX_THRESHOLD` (motion sensitivity), `PERSON_THRESH_PCT` / `PERSON_GREAT_PCT` /
+`VERIFY_MS` / `IMPROVE_MS` / `INFER_GAP_MS` (person verification & best-shot hunt),
+`GRACE_MS` / `ALERT_MS` / `COOLDOWN_MS` (timing), `SHAKE_AMP` / `SHAKE_SPEED` (head shake),
+`PING_INTERVAL_MS`.
 
 ## Maintainer notes (non-obvious)
 
@@ -74,7 +82,9 @@ Build from a short path (long Windows paths overflow the command-line limit duri
 ## Key files
 
 - `app_sentry/app_sentry.cpp` — app: presence gate + state machine + UI + alert + Telegram.
-- `app_sentry/motion_detect.{h,cpp}` — motion detector.
+- `app_sentry/motion_detect.{h,cpp}` — stage 1: motion wake-up.
+- `app_sentry/person_detect.{h,cpp}` + `person_detect.tflite` — stage 2: TFLM person
+  classifier (model embedded via `EMBED_FILES`; needs `espressif/esp-tflite-micro`).
 - `app_sentry/sentry_font_48.c` — custom Chinese font.
 - `app_sentry/tg_secret.h.example` — Telegram credential template.
 
