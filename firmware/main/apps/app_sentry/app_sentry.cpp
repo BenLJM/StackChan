@@ -75,6 +75,14 @@ static const uint32_t VERIFY_MS    = 5000;  // max hunt for a person after motio
 static const uint32_t IMPROVE_MS   = 1500;  // after confirm, keep hunting a better shot
 static const uint32_t INFER_GAP_MS = 350;   // min gap between inferences (each ~0.5 s)
 
+// ---- Alert-fatigue suppression ("visit" model) ----
+// We can't biometrically recognize "the same person" on this chip, so sameness is
+// temporal: person sightings closer together than REALERT_GAP_MS count as ONE ongoing
+// visit. Only the FIRST sighting of a visit fires the full alert + Telegram; later
+// sightings stay silent (serial log only) and slide the window. The sentry eye turns
+// ORANGE while a visit is being suppressed, back to red once the visitor is long gone.
+static const uint32_t REALERT_GAP_MS = 10 * 60 * 1000;  // re-alert only after 10 min unseen
+
 // ---- Presence tunables ----
 static const uint32_t PING_INTERVAL_MS = 4000;
 static const uint32_t PING_TIMEOUT_MS  = 1500;
@@ -123,6 +131,7 @@ static int _best_score         = -1;
 static uint32_t _confirm_ms    = 0;  // when a person was confirmed (0 = not yet)
 static uint32_t _last_infer_ms = 0;
 static bool _pd_ok             = false;  // person model usable? (else fall back to motion-only)
+static uint32_t _last_person_ms = 0;     // last confirmed person sighting (0 = none since arming)
 
 // ---- Owner presence via a background ICMP ping session ----
 static esp_ping_handle_t _ping_handle = nullptr;
@@ -256,10 +265,14 @@ static void animate_face(uint32_t now)
     lv_obj_align(_eye_r, LV_ALIGN_CENTER, 50, -14);
 }
 
-// Breathing red "sentry eye" — evil-robot glow. Call under LvglLockGuard when ST_ARMED.
+// Breathing "sentry eye" — evil-robot glow. Red = fully vigilant; orange = a recent
+// visitor is being suppressed (still watching, holding fire). Call under LvglLockGuard.
 static void animate_dot(uint32_t now)
 {
     if (!_dot) return;
+    bool quiet = (_last_person_ms != 0) && (now - _last_person_ms < REALERT_GAP_MS);
+    lv_obj_set_style_bg_color(_dot, lv_color_hex(quiet ? 0xFF8800 : 0xFF1010), 0);
+    lv_obj_set_style_shadow_color(_dot, lv_color_hex(quiet ? 0xFF8800 : 0xFF0000), 0);
     float ph = (float)(now % 1800) / 1800.0f;
     float s  = 0.5f - 0.5f * cosf(ph * 6.2831853f);  // 0..1..0 smooth
     int diam = 46 + (int)(s * 40.0f);                // 46..86 px
@@ -422,6 +435,7 @@ void AppSentry::onOpen()
     _confirm_ms      = 0;
     _best_score      = -1;
     _best_len        = 0;
+    _last_person_ms  = 0;
     _wifi_ok         = false;
     _present_seen_ms = GetHAL().millis();
     _cond            = C_NOWIFI;
@@ -456,7 +470,7 @@ void AppSentry::onRunning()
             _shake_dir = -_shake_dir;
             GetStackChan().motion().moveYawWithSpeed(_shake_dir * SHAKE_AMP, SHAKE_SPEED);
         }
-    } else if (_state == ST_ARMED || _state == ST_VERIFY) {
+    } else if (_state == ST_ARMED || _state == ST_VERIFY || _state == ST_COOLDOWN) {
         static uint32_t _last_dot_ms = 0;
         if (now - _last_dot_ms >= 40) {  // ~25 fps; don't invalidate LVGL every loop
             _last_dot_ms = now;
@@ -524,6 +538,7 @@ void AppSentry::onRunning()
         }
         if (cond == C_AWAY) {
             _md.reset();
+            _last_person_ms = 0;  // fresh arming: first sighting always alerts
             _pd_ok = person_detect_init();  // lazy: model + arena only when actually arming
             if (!_pd_ok) {
                 mclog::tagWarn(TAG, "person model unavailable -> motion-only alerts");
@@ -633,8 +648,18 @@ void AppSentry::onRunning()
         }
         case ST_VERIFY: {
             if (person >= PERSON_THRESH_PCT && _confirm_ms == 0) {
-                // Person confirmed: fire the deterrence NOW; the photo keeps improving
-                // for IMPROVE_MS more, then the best shot is sent.
+                bool new_visit  = (_last_person_ms == 0) || (now - _last_person_ms >= REALERT_GAP_MS);
+                _last_person_ms = now;
+                if (!new_visit) {
+                    // Same lingering visitor (seen < REALERT_GAP ago): stay silent and
+                    // slide the quiet window. No alert, no photo, no Telegram.
+                    mclog::tagInfo(TAG, "person again ({}%) within quiet window -> suppressed", person);
+                    _state    = ST_COOLDOWN;
+                    _state_ms = now;
+                    break;
+                }
+                // First sighting of a new visit: fire the deterrence NOW; the photo
+                // keeps improving for IMPROVE_MS more, then the best shot is sent.
                 _confirm_ms = now;
                 enter_alert = true;
                 show_view(V_LABEL);
