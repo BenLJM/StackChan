@@ -11,9 +11,10 @@ Update of this repo could be a little late than the released firmware and mobile
 ## This fork: Sentry Mode 🛡️
 
 This fork adds a presence-aware **security sentry** app (`firmware/main/apps/app_sentry/`):
-it arms only when you're away (detected via your phone on WiFi), and on an intruder it shows
-a warning, shakes its head, flashes red, and sends their photo to Telegram. When you're home
-it shows the normal StackChan face. See **[docs/sentry-mode.md](docs/sentry-mode.md)**.
+it arms only when you're away (detected via your phone on WiFi). Motion wakes it, an
+**on-device AI confirms the intruder is a person**, then it warns them (red screen,
+head-shake, LED flash) and sends their clearest frame to Telegram. When you're home it
+shows the normal StackChan face. See **[docs/sentry-mode.md](docs/sentry-mode.md)**.
 
 ----
 

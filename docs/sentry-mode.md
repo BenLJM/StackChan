@@ -14,6 +14,13 @@ photo to your phone via Telegram. When you're home it behaves like a normal Stac
 
 Returning home (phone rejoins WiFi) disarms within ~5 s and stops any active alert.
 
+**Alert fatigue (visit model)** — person sightings closer together than `REALERT_GAP_MS`
+(5 min) count as one *visit*: only the first sighting fires the alert + Telegram; later
+ones are silently logged and slide the window, so a colleague lingering near the camera
+produces exactly one notification. The sentry eye breathes **orange** instead of red while
+a visit is being suppressed. Re-arming (owner returns, then leaves again) resets this, and
+a visitor who stays perfectly still for longer than the gap re-alerts on their next move.
+
 ## How it works
 
 - **Presence** — a background `esp_ping` session pings the owner's phone (`OWNER_IP`). Each
@@ -63,6 +70,7 @@ Build from a short path (long Windows paths overflow the command-line limit duri
 `AWAY_CONFIRM_MS` (away lag), `MOTION_TRIG_PERMILLE` / `MOTION_STRONG_PERMILLE` /
 `PIX_THRESHOLD` (motion sensitivity), `PERSON_THRESH_PCT` / `PERSON_GREAT_PCT` /
 `VERIFY_MS` / `IMPROVE_MS` / `INFER_GAP_MS` (person verification & best-shot hunt),
+`REALERT_GAP_MS` (alert-fatigue quiet window, default 5 min),
 `GRACE_MS` / `ALERT_MS` / `COOLDOWN_MS` (timing), `SHAKE_AMP` / `SHAKE_SPEED` (head shake),
 `PING_INTERVAL_MS`.
 
