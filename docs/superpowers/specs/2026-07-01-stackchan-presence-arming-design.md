@@ -1,7 +1,10 @@
 # StackChan Sentry — WiFi Presence-Based Arming (Design)
 
+> **[SUPERSEDED — design doc]** Shipped and verified on-device. Authoritative as-built
+> reference: **[docs/sentry-mode.md](../../sentry-mode.md)**. Kept for design history.
+
 Date: 2026-07-01
-Status: implemented (app_sentry), pending live verification
+Status: implemented + verified on-device
 Related: [2026-06-26-stackchan-sentry-design.md](2026-06-26-stackchan-sentry-design.md)
 
 ## Problem

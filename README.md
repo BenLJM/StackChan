@@ -8,6 +8,15 @@ Update of this repo could be a little late than the released firmware and mobile
 
 ----
 
+## This fork: Sentry Mode 🛡️
+
+This fork adds a presence-aware **security sentry** app (`firmware/main/apps/app_sentry/`):
+it arms only when you're away (detected via your phone on WiFi), and on an intruder it shows
+a warning, shakes its head, flashes red, and sends their photo to Telegram. When you're home
+it shows the normal StackChan face. See **[docs/sentry-mode.md](docs/sentry-mode.md)**.
+
+----
+
 <img src="https://cdn.shopify.com/s/files/1/0056/7689/2250/files/5a589623895f65487717894d9240f6b8.png" width="60%">
 
 **StackChan is a super kawaii AI desktop robot co-created by M5Stack and the user community.** It uses the M5Stack **flagship IoT development kit [CoreS3](https://docs.m5stack.com/en/core/CoreS3)** as its main controller, powered by an ESP32-S3 SoC featuring a 240 MHz dual-core processor, with 16MB Flash and 8MB PSRAM onboard, and supporting Wi-Fi and BLE. The main unit also integrates a 2.0-inch capacitive touch display with a high-strength glass cover, a 0.3 MP camera, a proximity & ambient light sensor, a 9-axis IMU (accelerometer + gyroscope + magnetometer), a microSD card slot, a 1W speaker, dual microphones, and power/reset buttons. 

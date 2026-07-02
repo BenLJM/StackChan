@@ -66,8 +66,13 @@ dependencies:
   espressif/adc_battery_estimation: ^0.2.0
   espressif/esp_new_jpeg: ^0.6.1
 
-  # (Sentry uses camera motion detection; esp-dl face detection removed — its
-  #  detection box-decode is broken on this build, see git history.)
+  # Sentry person detection: TFLite-Micro "person_detect" classifier (96x96 gray,
+  # is-there-a-person). Independent of esp-dl, whose face-detect box-decode is
+  # broken on this build (removed — see git history).
+  espressif/esp-tflite-micro:
+    version: ^1.3.1
+    rules:
+    - if: target in [esp32s3]
 
   # SenseCAP Watcher Board
   wvirgil123/sscma_client:
