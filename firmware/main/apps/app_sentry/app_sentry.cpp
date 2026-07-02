@@ -81,7 +81,7 @@ static const uint32_t INFER_GAP_MS = 350;   // min gap between inferences (each 
 // visit. Only the FIRST sighting of a visit fires the full alert + Telegram; later
 // sightings stay silent (serial log only) and slide the window. The sentry eye turns
 // ORANGE while a visit is being suppressed, back to red once the visitor is long gone.
-static const uint32_t REALERT_GAP_MS = 10 * 60 * 1000;  // re-alert only after 10 min unseen
+static const uint32_t REALERT_GAP_MS = 5 * 60 * 1000;  // re-alert only after 5 min unseen
 
 // ---- Presence tunables ----
 static const uint32_t PING_INTERVAL_MS = 4000;
